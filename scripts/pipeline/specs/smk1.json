@@ -1,0 +1,37 @@
+{
+  "batch_id": "smk1",
+  "description": "10-task smoke batch: all medium (one R + one A), batch-6 rules, four sites.",
+  "batch_dir": "output",
+  "model": "claude-opus-5-5",
+  "effort": null,
+  "task_doc": "TASK_SMOKE.md",
+  "read_first": [
+    "run_info/b4__TASK4.md",
+    "run_info/b5__BATCH5_CONTRACT.md",
+    "run_info/b6__BATCH6_CONTRACT.md",
+    "docs/SKILL_TAXONOMY.md"
+  ],
+  "corrections": [
+    "run_info/b5__CORRECTIONS.md",
+    "run_info/b6map__CORRECTIONS.md"
+  ],
+  "reference_bundle": "output/reference/bestseller_price_bump_autumn_2022_window_up_8pct_006",
+  "difficulty": "medium",
+  "difficulty_rule": "Every task is medium = exactly two skills: metadata.skills is [one R code, one A code] matching its slot.",
+  "gate_flags": ["--medium-is-exactly-two"],
+  "prior_batch_roots": ["prior_batches/all"],
+  "near_dup_prior": "prior_batches/all/{site}",
+  "session_mode": "legacy",
+  "slots": [
+    {"slot": 1,  "site": "gitlab",         "pair": ["R1", "A1"],  "style": "terse"},
+    {"slot": 2,  "site": "gitlab",         "pair": ["R7", "A3"],  "style": "terse"},
+    {"slot": 3,  "site": "gitlab",         "pair": ["R5", "A10"], "style": "explicit"},
+    {"slot": 4,  "site": "reddit",         "pair": ["R4", "A8"],  "style": "terse"},
+    {"slot": 5,  "site": "reddit",         "pair": ["R3", "A7"],  "style": "explicit"},
+    {"slot": 6,  "site": "shopping",       "pair": ["R9", "A11"], "style": "terse"},
+    {"slot": 7,  "site": "shopping",       "pair": ["R1", "A2"],  "style": "terse"},
+    {"slot": 8,  "site": "shopping_admin", "pair": ["R10", "A7"], "style": "explicit"},
+    {"slot": 9,  "site": "shopping_admin", "pair": ["R2", "A4"],  "style": "terse"},
+    {"slot": 10, "site": "shopping_admin", "pair": ["R6", "A10"], "style": "terse"}
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "batch_id": "div3",
+  "description": "200-task diversity batch tuned with div1/div2 pass@16: the agent must look up every target (never named in the instruction) through a bounded lookup (~20 agent steps), 15% hard 3-skill chains, 10-20 action golden paths, fewer short official-like intents, open pairs weighted by div1+div2 pass@16 (saturated skill sets down-weighted). DeepSeek V4 Pro authors, Claude Opus verifies.",
+  "batch_dir": "output/div3",
+  "model": "aws/anthropic/bedrock-claude-opus-5-5",
+  "effort": null,
+  "roles": {
+    "default": {
+      "model": "aws/anthropic/bedrock-claude-opus-5-5",
+      "sonnet_model": "aws/anthropic/bedrock-claude-sonnet-5-5",
+      "small_model": "aws/anthropic/claude-haiku-4-5-v1",
+      "base_url": "${CUAGYM_GATEWAY_BASE_URL}",
+      "token_file": "~/.config/nvidia_inference_token",
+      "api_timeout_ms": 1800000
+    },
+    "author": {
+      "model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "small_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "base_url": "${CUAGYM_GATEWAY_BASE_URL}",
+      "token_file": "~/.config/nvidia_inference_token",
+      "api_timeout_ms": 1800000
+    }
+  },
+  "concurrency": {
+    "author": 12,
+    "verify": 6
+  },
+  "lane_size": 3,
+  "author_max_turns": 600,
+  "author_timeout_min": 240,
+  "author_retries": 1,
+  "diversity": true,
+  "family_cap": 1,
+  "task_doc": "TASK_DIVERSITY.md",
+  "read_first": [
+    "run_info/b4__TASK4.md",
+    "run_info/b5__BATCH5_CONTRACT.md",
+    "run_info/b6__BATCH6_CONTRACT.md",
+    "docs/SKILL_TAXONOMY.md"
+  ],
+  "corrections": [
+    "run_info/b5__CORRECTIONS.md",
+    "run_info/b6map__CORRECTIONS.md"
+  ],
+  "reference_bundle": "output/reference/bestseller_price_bump_autumn_2022_window_up_8pct_006",
+  "difficulty": "derived from the skill chain (medium or hard)",
+  "difficulty_rule": "Batch-5 rule: medium = 2 skills (at least one retrieval and one action); hard = 3+ skills with two distinct retrievals or one retrieval feeding two dependent actions, plus metadata.hard_criteria with >= 2 entries. A HARD slot must ship a hard task; never pad a chain.",
+  "extra_rules": [
+    "This batch must be learnable or hard for the current policy: div1's always-solved tasks named their target ('Ship order 000000304') and needed 3-7 clicks on one page. Make the agent search, filter, count, compare or follow a link chain to find what to act on.",
+    "But keep it reachable: in div2, 54 of 200 tasks were never solved in 16 tries, mostly reddit lookups that meant scanning every comment or post (72% of those rollouts hit the 50-step cap). A good div3 task needs 10-20 deliberate actions, not an open-ended crawl."
+  ],
+  "gate_flags": [],
+  "prior_batch_roots": [
+    "prior_batches/all",
+    "output/tasks",
+    "output/div1/tasks",
+    "output/div2/tasks"
+  ],
+  "near_dup_prior": "prior_batches/all/{site}",
+  "session_mode": "legacy",
+  "plan": {
+    "sites": {
+      "gitlab": 50,
+      "reddit": 50,
+      "shopping": 50,
+      "shopping_admin": 50
+    },
+    "seed": 3,
+    "seed_share": 0.2,
+    "field_share": 0.1,
+    "seed_min_gap": 0.35,
+    "explicit_share": 0.3,
+    "short_share": 0.1,
+    "hard_share": 0.15,
+    "drop_r9_only": true,
+    "require_lookup": true,
+    "golden_actions": [
+      10,
+      20
+    ],
+    "entity_candidates": 4,
+    "feedback": [
+      {
+        "per_task_csv": "output/screening/div1_p16_per_task.csv",
+        "tasks_dir": "output/div1/tasks"
+      },
+      {
+        "per_task_csv": "output/screening/div2_p16_per_task.csv",
+        "tasks_dir": "output/div2/tasks"
+      }
+    ]
+  }
+}

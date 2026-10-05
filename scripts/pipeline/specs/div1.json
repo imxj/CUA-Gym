@@ -1,0 +1,44 @@
+{
+  "batch_id": "div1",
+  "description": "20-task diversity pilot. Slots are planned from corpus gaps (uncovered official intents, never-checked state fields, unused entities); DeepSeek V4 Pro authors, Claude Opus verifies.",
+  "batch_dir": "output/div1",
+  "model": "claude-opus-5-5",
+  "effort": null,
+  "roles": {
+    "author": {
+      "model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "small_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "base_url": "${CUAGYM_GATEWAY_BASE_URL}",
+      "token_file": "~/.config/nvidia_inference_token",
+      "api_timeout_ms": 1800000
+    }
+  },
+  "diversity": true,
+  "family_cap": 1,
+  "task_doc": "TASK_DIVERSITY.md",
+  "read_first": [
+    "run_info/b4__TASK4.md",
+    "run_info/b5__BATCH5_CONTRACT.md",
+    "run_info/b6__BATCH6_CONTRACT.md",
+    "docs/SKILL_TAXONOMY.md"
+  ],
+  "corrections": [
+    "run_info/b5__CORRECTIONS.md",
+    "run_info/b6map__CORRECTIONS.md"
+  ],
+  "reference_bundle": "output/reference/bestseller_price_bump_autumn_2022_window_up_8pct_006",
+  "difficulty": "derived from the skill chain",
+  "difficulty_rule": "Batch-5 rule: medium = 2 skills (at least one retrieval and one action); hard = 3+ skills with two distinct retrievals or one retrieval feeding two dependent actions. Record metadata.difficulty and metadata.skills honestly and never pad a chain. Batch 6's all-medium override does not apply to this batch.",
+  "gate_flags": [],
+  "prior_batch_roots": ["prior_batches/all", "output/tasks"],
+  "near_dup_prior": "prior_batches/all/{site}",
+  "session_mode": "legacy",
+  "plan": {
+    "sites": {"gitlab": 5, "reddit": 5, "shopping": 5, "shopping_admin": 5},
+    "seed": 1,
+    "field_share": 0.4,
+    "explicit_share": 0.3,
+    "short_share": 0.4,
+    "entity_candidates": 4
+  }
+}

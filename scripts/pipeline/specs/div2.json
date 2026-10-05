@@ -1,0 +1,63 @@
+{
+  "batch_id": "div2",
+  "description": "200-task diversity batch (50 per site). Slots planned from corpus gaps: one inspiration per uncovered official-intent template, never-checked state-field groups, and corpus-thin skill pairs; DeepSeek V4 Pro authors in 5-slot sessions, Claude Opus verifies and fixes.",
+  "batch_dir": "output/div2",
+  "model": "claude-opus-5-5",
+  "effort": null,
+  "roles": {
+    "author": {
+      "model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "small_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "base_url": "${CUAGYM_GATEWAY_BASE_URL}",
+      "token_file": "~/.config/nvidia_inference_token",
+      "api_timeout_ms": 1800000
+    }
+  },
+  "concurrency": {
+    "author": 16,
+    "verify": 8
+  },
+  "lane_size": 3,
+  "diversity": true,
+  "family_cap": 1,
+  "task_doc": "TASK_DIVERSITY.md",
+  "read_first": [
+    "run_info/b4__TASK4.md",
+    "run_info/b5__BATCH5_CONTRACT.md",
+    "run_info/b6__BATCH6_CONTRACT.md",
+    "docs/SKILL_TAXONOMY.md"
+  ],
+  "corrections": [
+    "run_info/b5__CORRECTIONS.md",
+    "run_info/b6map__CORRECTIONS.md"
+  ],
+  "reference_bundle": "output/reference/bestseller_price_bump_autumn_2022_window_up_8pct_006",
+  "difficulty": "derived from the skill chain",
+  "difficulty_rule": "Batch-5 rule: medium = 2 skills (at least one retrieval and one action); hard = 3+ skills with two distinct retrievals or one retrieval feeding two dependent actions. Record metadata.difficulty and metadata.skills honestly and never pad a chain. Batch 6's all-medium override does not apply to this batch.",
+  "gate_flags": [],
+  "prior_batch_roots": [
+    "prior_batches/all",
+    "output/tasks",
+    "output/div1/tasks"
+  ],
+  "near_dup_prior": "prior_batches/all/{site}",
+  "session_mode": "legacy",
+  "plan": {
+    "sites": {
+      "gitlab": 50,
+      "reddit": 50,
+      "shopping": 50,
+      "shopping_admin": 50
+    },
+    "seed": 2,
+    "seed_share": 0.45,
+    "field_share": 0.15,
+    "seed_min_gap": 0.35,
+    "explicit_share": 0.3,
+    "short_share": 0.35,
+    "entity_candidates": 4
+  },
+  "author_max_turns": 600,
+  "author_timeout_min": 240,
+  "author_retries": 1
+}
