@@ -24,13 +24,13 @@ verified). Batch 6 is defined as a stack of overrides; read all of it:
 
 Where this file and those disagree, **this file wins**.
 
-## 2. Environment (set up 2026-10-02 on `testvm1`; verify, don't redo)
+## 2. Environment (set up 2026-10-02 on the generation box; verify, don't redo)
 
 | Thing | Where |
 |---|---|
 | Repo | `~/CUA-Gym` @ `harness/portable-setup`, hub @ `594c7b1c` |
 | Mocks | tmux `cua-gym-hub`, windows 0–4 = ports 8000–8004 (classifieds, gitlab, reddit, shopping_admin, shopping). Restart with `~/start_webarena_mocks.sh`. **Do not use `hub/deploy-all.sh`** — at `594c7b1c` it serves all 103 mocks and the WebArena ones land on 8088–8092. |
-| Endpoints | `.env` → `http://localhost:800X/`; map → `http://18.116.12.228:3000` |
+| Endpoints | `.env` → `http://localhost:800X/`; map → `http://<OSM_HOST>:3000` |
 | Inspiration corpus | `webarena_benchmarks/webarena.jsonl` (symlink to `~/webarena_benchmarks`) |
 | Reference bundle | `output/reference/bestseller_price_bump_autumn_2022_window_up_8pct_006/` — verified (initial 0.0, replay 1.0, REVIEW PASS, reachability PASS). The shape every bundle must match. |
 | NeMo row example | `cuagym/data/example.jsonl` (the reference task's exported row) |

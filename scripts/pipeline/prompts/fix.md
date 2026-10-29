@@ -19,5 +19,6 @@ Do this, following .claude/agents/web-orchestrator.md for how agents are spawned
 4. Confirm the gate is clean for this task; both commands must print nothing for it:
    python3 scripts/preflight_bundles.py $runs_dir --quiet | grep -A12 "$task_id"
    python3 scripts/empty_state_probe.py $runs_dir --quiet | grep -A12 "$task_id"
+$gate_waiver
 
 Your final answer is parsed by a program. Return exactly the requested JSON object: {"task_id": "$task_id", "verified": <bool>, "initial_score": <number or null>, "replay_score": <number or null>, "rounds": <int>, "failed_conditions": ["<anything still failing>"], "notes": "<what you changed>"}.

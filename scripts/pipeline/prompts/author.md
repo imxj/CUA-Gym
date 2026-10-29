@@ -26,6 +26,7 @@ Non-negotiables, restated because they are what break downstream:
 - Every scored control must be reachable by clicking from start_path. Prefer start_path "/".
 - Before writing each task, grep $inventory for its entities and verbs: no task_id collision with prior batches, and no value-swapped re-authoring of a prior task. Record the closest prior task in metadata.derived_from (or null).
 - Do NOT run validation code (preflight_bundles.py, check_reachability.py, empty_state_probe.py, run_webarena_task.py, Playwright). Verification is a later phase with its own agents. Use Bash only to read source, seed data, the benchmark and the inventories.
+$answer_rule
 $extra_rules
 A guard hook denies writes outside $site_dir/ and denies validation scripts; a denial means you are off-brief, not that you should find another way.
 

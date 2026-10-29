@@ -15,5 +15,6 @@ Whatever reward the rounds settle on must also pass the corpus gate, or the task
 Before you finish, both of these must print nothing for this task:
   python3 scripts/preflight_bundles.py $runs_dir --quiet | grep -A12 "$task_id"
   python3 scripts/empty_state_probe.py $runs_dir --quiet | grep -A12 "$task_id"
+$gate_waiver
 
 When the workflow finishes, your final answer is parsed by a program. Return exactly the requested JSON object: {"task_id": "<id>", "verified": <bool>, "initial_score": <number or null>, "replay_score": <number or null>, "rounds": <int>, "failed_conditions": ["<agreement condition that failed>", ...], "notes": "<one paragraph>"}.

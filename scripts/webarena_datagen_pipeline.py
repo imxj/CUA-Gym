@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import dataclasses
 import datetime as dt
 import fcntl
@@ -70,7 +71,7 @@ import diversity as div  # noqa: E402
 
 PY = sys.executable
 CANONICAL = ("task_instruction.json", "task.json", "reward.py", "nemo_reward.py", "nemo_task.json",
-             "initial_setup.py", "requirements.txt")
+             "initial_setup.py", "requirements.txt", "truth.py")
 DEFAULT_CLI = Path.home() / ".local" / "bin" / "claude"
 
 # --------------------------------------------------------------------------- guard policy
@@ -241,7 +242,7 @@ class Cfg:
     def endpoint_bases(self) -> dict[str, str]:
         """Mock base URLs from the environment (.env), as the runner resolves them."""
         out = {}
-        for site in div.SITES:
+        for site in (*div.SITES, "map"):
             url = os.environ.get(f"CUA_GYM_WEBARENA_{site.upper()}_URL")
             if url:
                 out[site] = url
@@ -557,8 +558,41 @@ def bash_verdict(command: str, writable: list[str], role: str, secrets_in_env: b
     return None
 
 
-def make_hooks(writable: list[str], role: str, log, secrets_in_env: bool = False):
+def make_hooks(writable: list[str], role: str, log, secrets_in_env: bool = False, hidden: list[str] | None = None):
+    """hidden: directories a blind session must not read (div5 truth retrofit: the stored answers), except where
+    they overlap the session's own writable set."""
     from claude_agent_sdk import HookMatcher
+    hidden_roots = [Path(h).resolve() for h in (hidden or [])]
+
+    def is_hidden(path: Path) -> bool:
+        if not hidden_roots or _allowed_write(path, writable):
+            return False
+        return any(path == h or h in path.parents for h in hidden_roots)
+
+    def covers_hidden(path: Path) -> bool:          # a recursive search from here would reach a hidden dir
+        return any(path == h or path in h.parents for h in hidden_roots)
+
+    def blind_bash_leak(command: str, cwd: Path) -> bool:
+        """A blind session runs from hub/ with absolute paths to its own output; anything that names a hidden dir,
+        another output path, the repo root as a whole, or climbs out of hub/ is a leak. A relative path with ".."
+        is resolved against the shell's cwd and any `cd` target in the command; it must stay inside hub/."""
+        hub = REPO / "hub"
+        lex = lambda p: Path(os.path.normpath(p))           # lexical: no symlink or automount surprises
+        bases = [cwd] + [lex(cwd / t) for t in re.findall(r"\bcd\s+([^\s;&|]+)", command)]
+        for tok in re.findall(r"[^\s'\";|&()=<>]*\.\.[^\s'\";|&()<>]*", command):
+            if re.fullmatch(r"\.{3,}", tok) or "/" not in tok and tok != "..":
+                continue                                   # an ellipsis or a range, not a path
+            if not any(lex(b / tok) == hub or hub in lex(b / tok).parents for b in bases):
+                return True
+        if any(str(h) in command or (REPO in h.parents and str(h.relative_to(REPO)) in command) for h in hidden_roots):
+            return True
+        for m in re.finditer(re.escape(str(REPO)) + r"(/[^\s'\";|&)]*)?", command):
+            sub = m.group(1) or ""
+            if sub.startswith("/hub/") or sub == "/hub" or sub.startswith("/scripts/"):
+                continue
+            if not _allowed_write(Path(m.group(0).rstrip("/")), writable):   # only inside its own output dirs
+                return True
+        return bool(re.search(r"(^|\s)~/CUA-Gym(/(output)?)?(\s|$)", command))
 
     def deny(reason: str) -> dict[str, Any]:
         log(f"\n[guard] DENY: {reason}\n")
@@ -573,8 +607,11 @@ def make_hooks(writable: list[str], role: str, log, secrets_in_env: bool = False
         try:
             if hook_input.get("tool_name") != "Bash":
                 return {}
-            reason = bash_verdict(str(hook_input.get("tool_input", {}).get("command", "")), writable, role,
-                                  secrets_in_env, start_dir(hook_input))
+            command = str(hook_input.get("tool_input", {}).get("command", ""))
+            if hidden_roots and blind_bash_leak(command, start_dir(hook_input)):
+                return deny("this session is blind to the batch's bundles, runs and exports; read only the mock "
+                            "data and source under hub/, and your own output directory")
+            reason = bash_verdict(command, writable, role, secrets_in_env, start_dir(hook_input))
             return deny(reason) if reason else {}
         except Exception as exc:  # noqa: BLE001 - fail closed
             return deny(f"guard error ({exc!r})")
@@ -600,6 +637,11 @@ def make_hooks(writable: list[str], role: str, log, secrets_in_env: bool = False
             target = str(tool_input.get("file_path") or tool_input.get("path") or "")
             if target and _is_secret(_resolve(start_dir(hook_input), target)):
                 return deny(f"{target} holds credentials or endpoint secrets")
+            if hidden_roots:
+                where = _resolve(start_dir(hook_input), target) if target else start_dir(hook_input)
+                if is_hidden(where) or (hook_input.get("tool_name") in ("Grep", "Glob") and covers_hidden(where)):
+                    return deny("this session is blind to the batch's bundles, runs and exports; search under hub/ "
+                                "(mock data and source) instead")
             return {}
         except Exception as exc:  # noqa: BLE001 - fail closed
             return deny(f"guard error ({exc!r})")
@@ -724,6 +766,7 @@ async def run_session(cfg: Cfg, sem: asyncio.Semaphore, stats: Stats, label: str
                       agent: str | None, writable: list[str], schema: dict[str, Any] | None, timeout: int,
                       max_turns: int, tools: list[str] | None = None,
                       followup=None, max_followups: int = 2, profile_role: str | None = None,
+                      hidden: list[str] | None = None, cwd: Path | None = None,
                       _attempt: int = 0) -> SessionResult:
     """One headless SDK session. Never raises; returns a degraded SessionResult instead.
 
@@ -753,7 +796,7 @@ async def run_session(cfg: Cfg, sem: asyncio.Semaphore, stats: Stats, label: str
     if agent:
         extra["agent"] = agent
     options = ClaudeAgentOptions(
-        cwd=str(REPO),
+        cwd=str(cwd or REPO),
         cli_path=cfg.cli_path,
         setting_sources=None,              # CLI defaults: user + project + local, so .claude/ agents load
         permission_mode="default" if role == "ping" else "bypassPermissions",
@@ -762,7 +805,7 @@ async def run_session(cfg: Cfg, sem: asyncio.Semaphore, stats: Stats, label: str
         disallowed_tools=["WebSearch", "WebFetch"] + (["Agent", "Task"] if role == "author" else []),
         # the session's own CLI config dir (gateway sessions) is where the CLI spills large tool results
         hooks=None if role == "ping" else make_hooks(writable + [str(sdir) + "/*"], role, transcript.write,
-                                                     secrets_in_env=bool(prof.get("base_url"))),
+                                                     secrets_in_env=bool(prof.get("base_url")), hidden=hidden),
         model=prof.get("model"), fallback_model=prof.get("fallback_model"), effort=prof.get("effort"),
         env=child_env(prof, sdir), max_turns=max_turns, max_budget_usd=cfg.max_budget_usd,
         output_format={"type": "json_schema", "schema": schema} if schema else None,
@@ -867,7 +910,8 @@ async def run_session(cfg: Cfg, sem: asyncio.Semaphore, stats: Stats, label: str
               f"pauses {pause}s, then retry {_attempt + 1}/{RATE_LIMIT_RETRIES} -> {rel(sdir)}", flush=True)
         return await run_session(cfg, sem, stats, label, prompt, role=role, agent=agent, writable=writable,
                                  schema=schema, timeout=timeout, max_turns=max_turns, tools=tools, followup=followup,
-                                 max_followups=max_followups, profile_role=profile_role, _attempt=_attempt + 1)
+                                 max_followups=max_followups, profile_role=profile_role, hidden=hidden, cwd=cwd,
+                                 _attempt=_attempt + 1)
     ok = status == "ok"
     record = {"label": label, "role": role, "agent": agent, "model": session_model, "ok": ok, "status": status,
               "last_subtype": last_subtype, "session_id": session_id, "structured": structured, **metrics}
@@ -913,7 +957,67 @@ def brief_values(cfg: Cfg, site: str) -> dict[str, Any]:
         "inventory": spec.get("inventory", "prior_batches/inventory/{site}.tsv").format(site=site),
         "extra_rules": "\n".join(f"- {r}" for r in spec.get("extra_rules", [])),
         "contract_rules": CONTRACT_RULES if cfg.diversity else "",
+        "answer_rule": (MAP_RULE if spec.get("map") else ANSWER_RULE) if spec.get("answer_scored_ok") else "",
     }
+
+
+
+# div4 (2026-10-08): WebArena's enumeration and give-up failures end in terminate(answer=...), so this batch needs
+# answer-scored tasks. The corpus contract (TASK4 S3.5, preflight_bundles.py) forbids tasks with no action skill;
+# the driver waives exactly that one message for slots marked answer_scored (stage_gate) and nothing else.
+ANSWER_RULE = """
+Exception for slots marked ANSWER-SCORED (this overrides "observable writeback" and "retrieval feeding the action"
+above for those slots only):
+- The task has no writeback. The agent finishes with terminate(answer=...); the runner hands that string to the reward
+  as CUA_GYM_AGENT_ANSWER (run_info/b4__TASK4.md) and a golden replay returns it (cua_gym_web/runner.py: a replay
+  may return the answer string). reward.py's evaluate(evidence) reads evidence["agent_answer"]; nemo_reward.py
+  fills it from CUA_GYM_AGENT_ANSWER (pattern: NEMO_TAIL in scripts/_osm_batch_gen.py). The reward still GETs
+  /go?sid= and prints "REWARD: <float>" on every path. No prior WebArena-site task is answer-scored: these are
+  the first, so follow this note over any older bundle.
+- Score by exact match or set equality after normalising case, whitespace, separators and order. This is a
+  deterministic check, not the free-form answer check web-orchestrator.md forbids. No fuzzy, semantic or LLM match.
+- The truth is computed by you from the mock's seed data (hub/websites/<app>/src/data) and inlined as a fixture.
+- metadata.skills lists retrieval skills only: medium = 2 retrievals (locate + aggregate, filter, sort or count),
+  hard = 3+ retrievals. The gate's "names no action skill (S3.5)" message is waived for these slots by the driver.
+"""
+
+
+# div6-map (2026-10-11): the map is an external OpenStreetMap deployment (Nominatim + OSRM), not a hub mock.
+MAP_RULE = """
+MAP TASKS (this batch; overrides the hub-mock rules above wherever they disagree). Read run_info/map__TASK_MAP.md
+in full first, especially sections 2 to 7 and 11; scripts/_osm_common.py, _osm_pilot_gen.py and _osm_batch_gen.py are
+the working reference (bundle writer, reward and nemo_reward templates, golden replays that click the UI).
+- App spec in task.json exactly: {"name": "webarena_map_mock", "source_name": "map", "base_url_env":
+  "CUA_GYM_WEBARENA_MAP_URL", "start_path": "/", "initial_state": null, "golden_state": null, "stateless": true}.
+  No initial_setup. No /post or /go calls anywhere: the map has no state API (the driver waives that gate line).
+- ANSWER-SCORED, answer only: reward.py reads evidence["agent_answer"]; nemo_reward.py is SELF-CONTAINED (MAP-2:
+  built from reward.py's own source, run as `python -` in an empty directory) and reads CUA_GYM_AGENT_ANSWER.
+  reward.py may import only collections, datetime, decimal, fractions, json, math, re, statistics, urllib.parse.
+- Ground truth: truth.py with compute(load, api) and render(answer). api.geocode(query) and api.route(engine, a, b)
+  (engine car / bike / foot; a, b = (lat, lon) at full precision) are the site's own Nominatim and OSRM calls;
+  api.fmt_time(seconds) and api.fmt_dist(metres) are the site's formatters. Run
+  `python3 scripts/pipeline/truth.py run <bundle>/truth.py` and inline exactly that answer in the reward.
+- Places: use the slot's harvested query strings (they round-trip to one hit). Geocode every place you name and keep
+  it only if the top hit is the intended place. MAP-3: a task that routes twice re-geocodes under a moved map; prefer
+  places whose names are unique in their city.
+- Margin discipline (section 5.2): for every time or distance the task asks for, compute the other engines' values;
+  if an unasked mode's value lies inside the reward tolerance of the asked one, drop the place pair. compute() should
+  assert this, so a collision fails the truth gate instead of shipping.
+- Tolerance in the reward: time +-1 minute or +-10% (whichever is larger), distance +-5%; accept "12 min",
+  "12 minutes", "12min", "0:12" and "1h 5min"; distances in m or km; place-name sets order-free and normalised. A
+  value outside tolerance, a missing item, or an extra wrong place scores 0 for that component. No LLM judge.
+- Never an "N/A" or "no route" answer: if OSRM finds no route, pick other places.
+- nemo_reward.py must contain the line `SID = "__CUA_GYM_SID__"` (unused: the map is stateless). Mingjie's exporter
+  drops any reward without the placeholder (div6-map batch 1 lost 4 tasks to this until it was patched).
+- Two-mode and multi-leg answers: bind every number to its mode or leg word; the right numbers under swapped modes
+  (walk 6 / drive 25 for walk 25 / drive 6) must score 0 for those parts. Batch 1's reward audit rejected a reward
+  that accepted swapped values.
+- Golden replay: clicks only (MAP 7.7), :visible locators (7.2), wait for the re-rendered sidebar (7.3), clear both
+  route fields before refilling (MAP-4), and returns the answer string read from #sidebar_content.
+- Record metadata.answer = {"kind", "truth", "tolerance"}, metadata.places (query strings), metadata.modes,
+  metadata.city, metadata.div6_family (the slot's M-family key, e.g. "m3_route_distance") and metadata.family: a
+  2-6 token snake_case slug naming YOUR task's shape (e.g. "walk_then_drive_total_minutes"), nothing else.
+"""
 
 
 CONTRACT_RULES = """
@@ -1042,6 +1146,18 @@ def stage_preflight(cfg: Cfg, stats: Stats) -> bool:
     check("endpoints resolve", proc.returncode == 0 and len(urls) >= 5, f"{len(urls)} apps")
     for site in cfg.sites:
         app, url = f"webarena_{site}_mock", urls.get(f"webarena_{site}_mock", "").rstrip("/")
+        if site == "map":                           # external OpenStreetMap stack, stateless: no /go?sid=
+            sys.path.insert(0, str(SCRIPTS))
+            import _osm_common as osm
+            try:
+                with urllib.request.urlopen(osm.SITE + "/", timeout=15) as resp:
+                    site_ok = resp.status == 200
+                hit = osm.nominatim("Worcester Public Library, Worcester")
+                dur, _ = osm.osrm("foot", (float(hit[0]["lat"]), float(hit[0]["lon"])), (42.2626, -71.8023))
+                check("map site, Nominatim and OSRM", site_ok and bool(hit) and dur > 0, osm.SITE)
+            except Exception as exc:  # noqa: BLE001
+                check("map site, Nominatim and OSRM", False, repr(exc)[:200])
+            continue
         try:
             with urllib.request.urlopen(f"{url}/go?sid=pipeline-preflight-{os.getpid()}", timeout=15) as resp:
                 doc = json.loads(resp.read())
@@ -1120,7 +1236,7 @@ async def stage_author(cfg: Cfg, state: State, stats: Stats, on_lane_done=None,
         return text
 
     async def lane(site: str, slots: list[dict[str, Any]]) -> None:
-        lines = "\n".join(brief(s) for s in slots)
+        lines = "\n".join(brief(s) for s in slots) + (peer_block(cfg, state, site) if cfg.spec.get("peer_brief") else "")
         prompt = render("author", **brief_values(cfg, site), n=len(slots), slot_lines=lines)
         label = f"author-{site}-s{slots[0]['slot']}"
         res = await run_session(cfg, sem, stats, label, prompt, role="author", agent="task-author",
@@ -1144,6 +1260,34 @@ async def stage_author(cfg: Cfg, state: State, stats: Stats, on_lane_done=None,
     missing = [s["slot"] for s in cfg.slots if not state.slot(s["slot"]).get("task_id")]
     if missing:
         print(f"author: slots still empty after authoring: {missing}")
+
+
+ANSWER_WAIVED = re.compile(r"names no action skill")
+# The hub-mock contract assumes a hub app with a session id; the map is an external, stateless site
+# (CuaGymTaskInfo.external_base_url, TASK_MAP.md MAP-1), so these lines cannot apply to it (div6-map, 2026-10-12).
+STATELESS_WAIVED = re.compile(r"does not GET /go\?sid=|does not POST to /post\?sid=|is not in APP_DIRS|"
+                              r"does not contain __CUA_GYM_SID__")
+
+
+def peer_block(cfg: Cfg, state: State, site: str) -> str:
+    """Instructions already written in this batch for a site, so a new author picks a different errand type.
+    (div4, 2026-10-09: 6 example sub-types over 25 shopping slots gave 4 paraphrases each of "when did I last buy X"
+    and "which reviewers mention X"; paraphrases slip past the template gate.)"""
+    intents = []
+    for _, s, t in state.current():
+        if s != site:
+            continue
+        try:
+            intents.append(json.loads((cfg.bundle(t, s) / "task_instruction.json").read_text(encoding="utf-8"))
+                           ["task_instruction"])
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+    if not intents:
+        return ""
+    return ("\nAlready written in this batch for " + site + " (" + str(len(intents)) + "). Each new task must be a "
+            "different KIND of errand from all of these, not the same question about another product, user or "
+            "month: change what is enumerated or aggregated, the predicate, or the answer kind.\n"
+            + "\n".join("  * " + i for i in intents))
 
 
 async def stage_gate(cfg: Cfg, state: State, stats: Stats, only: set[str] | None = None) -> dict[str, list[str]]:
@@ -1197,6 +1341,40 @@ async def stage_gate(cfg: Cfg, state: State, stats: Stats, only: set[str] | None
         for tid, reasons in (await asyncio.to_thread(diversity_checks)).items():
             if reasons:
                 failures.setdefault(tid, []).extend(reasons)
+    truth_slots = [(n, site, tid) for n, site, tid in state.current() if state.slot(n).get("code_truth")
+                   and (not only or tid in only)]
+    if truth_slots:                                   # div5 hand-off 3C: the expected answer must come from truth.py
+        import truth as tr
+
+        def truth_checks() -> dict[str, dict]:
+            states: dict[str, dict] = {}
+            out = {}
+            for n, site, tid in truth_slots:
+                b = cfg.bundle(tid, site)
+                if not (b / "task.json").is_file():   # an interrupted author leaves a partial bundle
+                    out[tid] = {"verdict": "error", "problems": ["bundle is incomplete (no task.json)"]}
+                    continue
+                if state.slot(n).get("mutation"):     # div7 C: target values, checked against reward.EXPECTED
+                    out[tid] = tr.check_mutation(b, b / "truth.py")
+                    continue
+                for a in tr.app_dirs(b):
+                    if a not in states:
+                        states[a] = tr.live_state(a)
+                out[tid] = tr.check(b, b / "truth.py", states)
+            return out
+        for tid, rec in (await asyncio.to_thread(truth_checks)).items():
+            state.task(tid)["truth"] = {k: rec.get(k) for k in ("verdict", "answer", "rendered", "answer_sha256",
+                                                                 "data_files", "reference_score", "giveup_scores",
+                                                                 "wrong_move_scores", "problems", "reproducible")}
+            if rec["verdict"] != "match":
+                failures.setdefault(tid, []).extend(f"truth: {p}" for p in rec["problems"] or [rec["verdict"]])
+    for n, _, tid in state.current():                 # div4: S3.5 does not apply to answer-scored slots
+        if state.slot(n).get("answer_scored") and tid in failures:
+            failures[tid] = [r for r in failures[tid] if not ANSWER_WAIVED.search(r)]
+        if state.slot(n).get("stateless") and tid in failures:   # div6-map: the map has no state API to GET
+            failures[tid] = [r for r in failures[tid] if not STATELESS_WAIVED.search(r)]
+            if not failures[tid]:
+                del failures[tid]
     flags: dict[str, str] = {}
     for site in cfg.sites:
         prior_dir = cfg.spec.get("near_dup_prior", "prior_batches/all/{site}").format(site=site)
@@ -1239,7 +1417,8 @@ async def stage_repair(cfg: Cfg, state: State, stats: Stats, failed: dict[str, s
             return
         dest = reject(cfg, state, n, tid, why, kind)
         rec = state.slot(n)
-        prompt = render("repair", **brief_values(cfg, site), slot=n, contract=div.slot_brief({"slot": n, **rec}),
+        contract = div.slot_brief({"slot": n, **rec}) + (peer_block(cfg, state, site) if cfg.spec.get("peer_brief") else "")
+        prompt = render("repair", **brief_values(cfg, site), slot=n, contract=contract,
                         old_id=tid, rejected_path=rel(dest), reason=why,
                         nnn=f"{n:03d}", round=rec["replacements"])
         res = await run_session(cfg, sem, stats, f"repair-{site}-slot{n}", prompt, role="author",
@@ -1257,6 +1436,27 @@ async def stage_repair(cfg: Cfg, state: State, stats: Stats, failed: dict[str, s
     return new_ids
 
 
+def gate_waiver(slot: dict[str, Any]) -> str:
+    """What verify / fix sessions must know about a slot the gate treats differently (div4 answer-scored tasks)."""
+    if not slot.get("answer_scored"):
+        return ""
+    truth_note = ("\nThe expected answer is computed by truth.py in the task bundle (div5: code-computed ground truth). "
+                  "Never change the expected answer by hand; reward.py must pay exactly 1.0 for render(compute()). "
+                  "Check with: python3 scripts/pipeline/truth.py check <run dir> --truth <bundle>/truth.py "
+                  "(verdict must be \"match\"). If you are certain truth.py itself misreads the task, say so in "
+                  "failed_conditions instead of editing the answer." if slot.get("code_truth") else "")
+    if slot.get("stateless"):
+        truth_note += ("\nThe map is an external, stateless site: preflight_bundles.py prints \"eval_reward_code does "
+                       "not GET /go?sid=\", \"does not contain __CUA_GYM_SID__\" and \"app_dir 'webarena_map_mock' is "
+                       "not in APP_DIRS\" for it, and the driver waives exactly those lines. The map's truth.py uses compute(load, "
+                       "api); `truth.py check` also runs nemo_reward.py the way a rollout runs it, and both must agree.")
+    return truth_note + "\n" + ("This task is ANSWER-SCORED: the reward compares CUA_GYM_AGENT_ANSWER with a fixed truth by exact match or "
+            "set equality, which is deterministic and allowed. golden_replay.py must return the answer string (the "
+            "runner uses it as the replay lane's answer); the initial lane has no answer and must score 0.0. "
+            "preflight_bundles.py prints \"names no action skill ... (S3.5)\" for it: the driver waives that one "
+            "line, so ignore it and do not add a writeback. Every other gate line still applies.")
+
+
 async def stage_verify(cfg: Cfg, state: State, stats: Stats, only: set[str] | None = None,
                        sem: asyncio.Semaphore | None = None) -> dict[str, bool]:
     sem = sem or asyncio.Semaphore(cfg.verify_concurrency)
@@ -1272,7 +1472,8 @@ async def stage_verify(cfg: Cfg, state: State, stats: Stats, only: set[str] | No
             rd.mkdir(parents=True, exist_ok=True)
         bundle = cfg.bundle(tid, site)
         prompt = render("verify", task_json=str(bundle / "task.json"), bundle_dir=rel(bundle), run_dir=str(rd),
-                        mode=cfg.spec.get("session_mode", "legacy"), task_id=tid, runs_dir=rel(cfg.runs_dir))
+                        mode=cfg.spec.get("session_mode", "legacy"), task_id=tid, runs_dir=rel(cfg.runs_dir),
+                        gate_waiver=gate_waiver(state.slot(n)))
 
         def unfinished(report: dict[str, Any] | None) -> str | None:
             """Ask again only when the workflow stopped short, never after a genuine three-round failure."""
@@ -1330,6 +1531,195 @@ def verify_failure_reason(cfg: Cfg, state: State, tid: str) -> str:
     return "\n".join(parts)
 
 
+TRUTH_SCHEMA = {"type": "object", "properties": {
+    "tasks": {"type": "array", "items": {"type": "object", "properties": {
+        "task_id": {"type": "string"}, "written": {"type": "boolean"}, "notes": {"type": "string"}},
+        "required": ["task_id", "written"]}},
+    "notes": {"type": "string"}}, "required": ["tasks"]}
+TRIAGE_SCHEMA = {"type": "object", "properties": {
+    "task_id": {"type": "string"},
+    "verdict": {"type": "string", "enum": ["stored_wrong", "reward_format", "code_wrong", "ambiguous", "defect"]},
+    "correct_answer": {"type": "string"}, "evidence": {"type": "string"}, "truth_fixed": {"type": "boolean"},
+    "notes": {"type": "string"}}, "required": ["task_id", "verdict", "evidence"]}
+
+
+def truth_dir(cfg: Cfg) -> Path:
+    return cfg.batch_dir / "truth"
+
+
+def answer_tasks(cfg: Cfg, state: State) -> list[tuple[str, str, Path]]:
+    """(site, task_id, bundle) of every current answer-scored task (metadata.answer present); once the batch is
+    exported, only the exported ones."""
+    export = cfg.batch_dir / f"{cfg.batch_id}_webarena.jsonl"
+    shipped = {json.loads(l)["context_compaction_task_id"] for l in export.open(encoding="utf-8") if l.strip()} \
+        if export.is_file() else None
+    out = []
+    for _, site, tid in state.current():
+        b = cfg.bundle(tid, site)
+        meta = (read_manifest(b) or {}).get("metadata") or {}
+        if isinstance(meta.get("answer"), dict) and (not cfg.only or tid in cfg.only) \
+                and (shipped is None or tid in shipped):
+            out.append((site, tid, b))
+    return out
+
+
+async def stage_truth(cfg: Cfg, state: State, stats: Stats, sem: asyncio.Semaphore | None = None) -> list[dict]:
+    """Retrofit code-computed ground truth (div5 hand-off 3C) over a finished batch's answer-scored tasks.
+
+    1. Blind sessions write <batch>/truth/<task_id>/truth.py from the instruction, any setup program and the mock
+       data and source only: the bundles, runs, exports and session logs are hidden by the guard.
+    2. scripts/pipeline/truth.py checks every module: reproducible, reward.py pays 1.0 for the rendered answer,
+       give-up answers pay < 0.5.
+    3. Every task that is not a match goes to a triage session (not blind) that decides who is right.
+    Writes <batch>/truth/report.jsonl and TRUTH_REPORT.md."""
+    import truth as tr
+    out = truth_dir(cfg)
+    tasks = answer_tasks(cfg, state)
+    hidden = [str(p) for p in (cfg.tasks_dir, cfg.runs_dir, cfg.rejected_dir, cfg.pipe_dir / "sessions")]
+    hidden += [str(p) for p in cfg.batch_dir.glob("set_aside*")] + [str(p) for p in cfg.batch_dir.glob("*.jsonl")]
+    todo = [(s, t, b) for s, t, b in tasks if cfg.force or not (out / t / "truth.py").is_file()]
+    size = max(1, int(cfg.spec.get("truth_lane_size", 4)))
+    by_site: dict[str, list[tuple[str, Path]]] = {}
+    for s, t, b in todo:
+        by_site.setdefault(s, []).append((t, b))
+    lanes = [(s, items[i:i + size]) for s, items in by_site.items() for i in range(0, len(items), size)]
+    sem = sem or asyncio.Semaphore(cfg.author_concurrency)
+    runner = REPO / "scripts" / "pipeline" / "truth.py"
+
+    async def lane(site: str, items: list[tuple[str, Path]]) -> None:
+        lines = []
+        for t, b in items:
+            ti = json.loads((b / "task_instruction.json").read_text(encoding="utf-8"))
+            kind = (((read_manifest(b) or {}).get("metadata") or {}).get("answer") or {}).get("kind", "")
+            setup = (b / "initial_setup.py").read_text(encoding="utf-8") if (b / "initial_setup.py").is_file() else ""
+            lines.append(f"- task_id: {t}\n  app_dir: {ti.get('app_dir')}\n  instruction: {json.dumps(ti['task_instruction'])}"
+                         f"\n  answer kind: {kind or 'see the instruction'}"
+                         + (f"\n  setup program (runs before the agent starts):\n```python\n{setup}\n```" if setup else ""))
+            if not cfg.dry_run:
+                (out / t).mkdir(parents=True, exist_ok=True)
+        prompt = render("truth", batch_id=cfg.batch_id, out_dir=str(out), runner=str(runner), task_lines="\n".join(lines))
+        writable = [p for t, _ in items for p in (str(out / t), str(out / t) + "/*")]
+        await run_session(cfg, sem, stats, f"truth-{site}-{items[0][0].rsplit('_', 1)[-1]}", prompt, role="truth",
+                          profile_role="author", agent=None, writable=writable, schema=TRUTH_SCHEMA,
+                          timeout=cfg.author_timeout, max_turns=cfg.author_max_turns, hidden=hidden, cwd=REPO / "hub")
+
+    if lanes:
+        print(f"truth: {len(todo)} task(s) in {len(lanes)} blind session(s)")
+        await asyncio.gather(*(lane(s, it) for s, it in lanes))
+
+    def check_all(items) -> list[dict]:
+        states: dict[str, dict] = {}
+        recs = []
+        for s, t, b in items:
+            for a in tr.app_dirs(b):
+                if a not in states:
+                    states[a] = tr.live_state(a)
+            recs.append({"site": s, **tr.check(b, out / t / "truth.py", states)})
+        return recs
+    recs = await asyncio.to_thread(check_all, tasks)
+
+    triage_sem = asyncio.Semaphore(cfg.verify_concurrency)
+
+    async def triage(rec: dict) -> None:
+        b = cfg.bundle(rec["task_id"], rec["site"])
+        shown = {k: v for k, v in rec.items() if k not in ("reference_code", "truth_py")}
+        prompt = render("truth_triage", batch_id=cfg.batch_id, task_id=rec["task_id"], bundle=str(b),
+                        truth_py=rec["truth_py"], check_json=json.dumps(shown, indent=1, default=str)[:6000])
+        res = await run_session(cfg, triage_sem, stats, f"truthtriage-{rec['task_id']}", prompt, role="truth",
+                                profile_role="verify", agent=None, writable=[rec["truth_py"]], schema=TRIAGE_SCHEMA,
+                                timeout=cfg.verify_timeout, max_turns=cfg.verify_max_turns)
+        rec["triage"] = res.data or {"verdict": "unknown", "evidence": f"triage session {res.status}"}
+
+    bad = [r for r in recs if r["verdict"] != "match" and r["verdict"] != "no_truth"]
+    if bad and not cfg.dry_run:
+        print(f"truth: {len(bad)} task(s) to triage")
+        await asyncio.gather(*(triage(r) for r in bad))
+        fixed = [r for r in bad if (r.get("triage") or {}).get("verdict") == "code_wrong"]
+        if fixed:                                         # re-check the modules triage repaired
+            again = {r2["task_id"]: r2 for r2 in await asyncio.to_thread(
+                check_all, [(r["site"], r["task_id"], cfg.bundle(r["task_id"], r["site"])) for r in fixed])}
+            for r in fixed:
+                r["recheck_verdict"] = again[r["task_id"]]["verdict"]
+                r.update({k: again[r["task_id"]][k] for k in ("answer", "rendered", "answer_sha256", "data_files",
+                                                                "reference_score") if k in again[r["task_id"]]})
+    if not cfg.dry_run:
+        out.mkdir(parents=True, exist_ok=True)
+        with (out / "report.jsonl").open("w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r, default=str) + "\n")
+        (out / "TRUTH_REPORT.md").write_text(truth_report(cfg, recs), encoding="utf-8")
+    counts = collections.Counter(r["verdict"] for r in recs)
+    tri = collections.Counter((r.get("triage") or {}).get("verdict") for r in recs if r.get("triage"))
+    print(f"truth: {dict(counts)}; triage: {dict(tri)} -> {rel(out / 'TRUTH_REPORT.md')}")
+    return recs
+
+
+def truth_report(cfg: Cfg, recs: list[dict]) -> str:
+    """Markdown: per-task verdicts of the code-computed truth retrofit; mismatches first."""
+    def short(v: Any) -> str:
+        return json.dumps(v, default=str)[:160].replace("|", "/")
+    counts = collections.Counter(r["verdict"] for r in recs)
+    tri = collections.Counter((r.get("triage") or {}).get("verdict", "-") for r in recs if r["verdict"] != "match")
+    lines = [f"# Code-computed truth retrofit: {cfg.batch_id} ({len(recs)} answer-scored tasks)", "",
+             f"Generated {now_iso()} by `webarena_datagen_pipeline.py truth`. A blind session wrote truth.py for "
+             f"each task from the instruction, any setup program and the mock data and source (bundles hidden); "
+             f"scripts/pipeline/truth.py ran it twice and scored its rendered answer with the task's own reward.py.",
+             "", "| check verdict | tasks |", "|---|---|"] + [f"| {k} | {v} |" for k, v in counts.most_common()]
+    lines += ["", "Triage of the tasks that are not a match:", "", "| triage verdict | tasks |", "|---|---|"]
+    lines += [f"| {k} | {v} |" for k, v in tri.most_common()]
+    lines += ["", "stored_wrong and reward_format are verifier bugs: the task currently teaches the wrong answer or "
+              "rejects the right one. ambiguous: the instruction has two readings. code_wrong: the truth module was "
+              "wrong and triage fixed it.", "",
+              "| task | site | check | triage | stored answer | code answer | evidence / fix |", "|---|---|---|---|---|---|---|"]
+    order = {"stored_wrong": 0, "reward_format": 1, "ambiguous": 2, "defect": 3, "code_wrong": 4}
+    for r in sorted(recs, key=lambda r: (r["verdict"] == "match", order.get((r.get("triage") or {}).get("verdict"), 9),
+                                         r["task_id"])):
+        t = r.get("triage") or {}
+        ev = (t.get("evidence", "") + (" | fix: " + t["notes"] if t.get("notes") else "") or "; ".join(r.get("problems", [])))
+        lines.append(f"| {r['task_id']} | {r['site']} | {r['verdict']} | {t.get('verdict', '')} | {short(r.get('stored_truth'))} "
+                     f"| {short(r.get('answer'))} | {ev[:400].replace('|', '/').replace(chr(10), ' ')} |")
+    return "\n".join(lines) + "\n"
+
+
+UI_METHODS = {"click", "dblclick", "fill", "type", "press", "check", "uncheck", "selectOption", "setInputFiles", "hover",
+              "tap", "goto"}
+
+
+def replay_ui_actions(run_dir: Path) -> int | None:
+    """UI actions (clicks, fills, key presses, selects, page loads) in the verified golden replay's Playwright trace.
+    div8 correction 2026-10-15: a rung's shortest UI path must be <= 30 actions (50-step cap, exploration ~2x)."""
+    c = replay_methods(run_dir)
+    return None if c is None else sum(v for k, v in c.items() if k in UI_METHODS)
+
+
+def replay_methods(run_dir: Path) -> collections.Counter | None:
+    """Playwright methods (and goto URLs under "goto:<url>") in the verified golden replay's trace."""
+    import zipfile
+    want = None
+    if (run_dir / "verification.json").is_file():
+        want = json.loads((run_dir / "verification.json").read_text(encoding="utf-8")).get("run_id")
+    cands = sorted((z.parent for z in [*run_dir.glob("*/replay-trace.zip"), *run_dir.glob("replay-trace.zip")]),
+                   key=lambda a: a.stat().st_mtime, reverse=True)
+    match = [a for a in cands if want and (a / "verification.json").is_file()
+             and json.loads((a / "verification.json").read_text(encoding="utf-8")).get("run_id") == want]
+    for a in (match or cands)[:1]:
+        c: collections.Counter = collections.Counter()
+        with zipfile.ZipFile(a / "replay-trace.zip") as zz:
+            for name in zz.namelist():
+                if name.endswith(".trace"):
+                    for line in zz.read(name).decode(errors="ignore").splitlines():
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        if e.get("type") == "before" and e.get("method"):
+                            c[e["method"]] += 1
+                            if e["method"] == "goto":
+                                c["goto:" + str((e.get("params") or {}).get("url"))] += 1
+        return c
+    return None
+
+
 async def stage_post(cfg: Cfg, state: State, stats: Stats) -> None:
     verified = [(n, s, t) for n, s, t in state.current() if task_is_complete(cfg.run_dir(t))]
     for n, site, tid in verified:
@@ -1368,6 +1758,26 @@ async def stage_post(cfg: Cfg, state: State, stats: Stats) -> None:
         problems = regate.get(tid, []) + [f"reachability: {p}" for p in reach_fail.get(tid, [])]
         if tid in reach_fail and not reach_fail[tid]:
             problems.append("reachability: UNREACHABLE")
+        if cap := state.slot(n).get("max_ui_actions"):          # div8 correction 2026-10-15
+            k = replay_ui_actions(cfg.run_dir(tid))
+            state.task(tid)["ui_actions"] = k
+            if k is not None and k > cap:
+                problems.append(f"length: the verified golden replay takes {k} UI actions (limit {cap}; an exploring "
+                                f"policy needs about twice that within the 50-step cap). Make the rung test a harder "
+                                f"decision on a shorter path, or leave the rung undelivered; never ask for a higher cap")
+            meta = (read_manifest(cfg.bundle(tid, site)) or {}).get("metadata") or {}
+            if meta.get("needs_long_steps"):
+                problems.append("length: metadata.needs_long_steps is set; a rung above the 50-step cap is not delivered")
+        if state.slot(n).get("div10"):                             # div10 T2: the policy has no navigate or tab action
+            c = replay_methods(cfg.run_dir(tid)) or {}
+            urls = [k[5:] for k in c if k.startswith("goto:")]
+            if c.get("goto", 0) > 1 or c.get("newPage", 0) > 1:
+                problems.append(f"T2 clicks only: the verified golden replay loads {c.get('goto', 0)} pages by URL "
+                                f"({'; '.join(u[:90] for u in urls[:4])}) and opens {c.get('newPage', 0)} tabs; after "
+                                f"the runner's start page every page must be reached with clicks, typing, keys and "
+                                f"scrolling (our policy has no navigate or tab action). Rewrite golden_replay.py with "
+                                f"the on-page filters, sorts, search boxes and links, or change the task so they reach "
+                                f"the target")
         state.task(tid)["post"] = {"pass": not problems, "problems": problems, "at": now_iso()}
     await asyncio.to_thread(run_cmd, cfg, stats, [PY, "scripts/_b5_status.py", "--runs", rel(cfg.runs_dir),
                                                    "--failures"], name="post_status")
@@ -1388,7 +1798,8 @@ async def stage_fix(cfg: Cfg, state: State, stats: Stats, sem: asyncio.Semaphore
     async def one(n: int, site: str, tid: str) -> None:
         rd = cfg.run_dir(tid)
         reasons = "\n".join(f"- {p}" for p in state.task(tid)["post"].get("problems", []))
-        prompt = render("fix", task_id=tid, run_dir=str(rd), runs_dir=rel(cfg.runs_dir), reasons=reasons)
+        prompt = render("fix", task_id=tid, run_dir=str(rd), runs_dir=rel(cfg.runs_dir), reasons=reasons,
+                        gate_waiver=gate_waiver(state.slot(n)))
         res = await run_session(cfg, sem, stats, f"fix-{tid}", prompt, role="verify", agent="orchestrator",
                                 writable=[str(rd), str(rd) + "/*"], schema=VERIFY_SCHEMA,
                                 timeout=cfg.verify_timeout, max_turns=cfg.verify_max_turns)
@@ -1446,11 +1857,16 @@ def stage_export(cfg: Cfg, state: State, stats: Stats) -> Path | None:
     print("\n".join("  " + line for line in proc.stdout.strip().splitlines()))
     eligible = {t for _, _, t in state.current() if state.task(t).get("post", {}).get("pass")}
     rows = []
+    ext = cfg.spec.get("external_base_url") or {}
     if raw.is_file():
         for line in raw.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
             if row.get("context_compaction_task_id") in eligible:
-                rows.append(line)
+                for task in (row.get("task_payload") or {}, (row.get("verifier_metadata") or {}).get("task") or {}):
+                    cg = task.get("cuagym") or {}
+                    if cg.get("app_dir") in ext:          # an off-hub site (the map): CuaGymTaskInfo.external_base_url
+                        cg["external_base_url"] = ext[cg["app_dir"]]
+                rows.append(json.dumps(row, ensure_ascii=False) if ext else line)
     final = cfg.batch_dir / f"{cfg.batch_id}_webarena.jsonl"
     if cfg.dry_run:
         print(f"[dry-run] would write {len(rows)} rows to {rel(final)}")
@@ -1460,9 +1876,108 @@ def stage_export(cfg: Cfg, state: State, stats: Stats) -> Path | None:
     for _, _, tid in state.current():
         state.task(tid)["exported"] = tid in exported
     state.data["stages"]["export"] = {"at": now_iso(), "rows": len(rows), "path": rel(final)}
+    if cfg.spec.get("provenance"):
+        side = write_provenance(cfg, state, exported)
+        state.data["stages"]["export"]["provenance"] = rel(side)
+        print(f"export: provenance sidecar -> {rel(side)}")
     state.save()
     print(f"export: {len(rows)}/{len(cfg.slots)} slots -> {rel(final)}")
     return final
+
+
+def write_provenance(cfg: Cfg, state: State, exported: set[str]) -> Path:
+    """One row per exported task (div5 hand-off section 4): parent, variant, failure, and the code that computes the
+    expected answer with the sha256 of every data file it read. Re-runs every truth.py against the final bundle."""
+    import truth as tr
+    side = cfg.batch_dir / f"{cfg.batch_id}_webarena.provenance.jsonl"
+    states: dict[str, dict] = {}
+    with side.open("w", encoding="utf-8") as fh:
+        for n, site, tid in state.current():
+            if tid not in exported:
+                continue
+            b = cfg.bundle(tid, site)
+            meta = (read_manifest(b) or {}).get("metadata") or {}
+            slot = state.slot(n)
+            rec: dict[str, Any] = {}
+            row = {"task_id": tid, "parent_task_id": meta.get("parent_task_id") or slot.get("parent_task_id"),
+                   "parent_pass_rate": slot.get("parent_pass_rate"),
+                   "variant_type": meta.get("variant_type") or slot.get("variant_type") or "new",
+                   "failure_summary": meta.get("failure_summary") or slot.get("failure_summary"),
+                   "ground_truth_method": "state_check", "reference_code": None, "data_files": []}
+            if slot.get("div7_family") or meta.get("ladder_id") or meta.get("source_failure_ids"):
+                row.update({"family": slot.get("div7_family") or meta.get("div7_family"),
+                            "rung": meta.get("rung") or slot.get("rung"),
+                            "ladder_id": meta.get("ladder_id") or slot.get("ladder_id"),
+                            "source_failure_ids": meta.get("source_failure_ids")
+                            or [f.get("task_id") for f in slot.get("source_failures") or []]})
+            if (b / "truth.py").is_file() and slot.get("mutation"):   # div7 state-change: target values vs EXPECTED
+                rec = tr.check_mutation(b, b / "truth.py")
+                row.update({"ground_truth_method": "code" if rec["verdict"] == "match" else "manual",
+                            "reference_code": rec.get("reference_code"), "data_files": rec.get("data_files", []),
+                            "expected": rec.get("answer"), "answer_sha256": rec.get("answer_sha256"),
+                            "truth_check": rec["verdict"], "near_misses": meta.get("near_misses")})
+            elif (b / "truth.py").is_file():
+                for a in tr.app_dirs(b):
+                    if a not in states:
+                        states[a] = tr.live_state(a)
+                rec = tr.check(b, b / "truth.py", states)
+                if rec.get("api_calls"):
+                    row.update({"family": meta.get("div6_family") or slot.get("div4_family"), "shape": meta.get("family"),
+                                "city": meta.get("city"),
+                                "places": meta.get("places"), "modes": meta.get("modes"),
+                                "api_calls": rec["api_calls"],
+                                "osrm": [{"engine": c["args"][0], "from": c["args"][1], "to": c["args"][2],
+                                          "duration_s": c.get("duration_s"), "distance_m": c.get("distance_m")}
+                                         for c in rec["api_calls"] if c.get("fn") == "route"]})
+                row.update({"ground_truth_method": "code" if rec["verdict"] == "match" else "manual",
+                            "reference_code": rec.get("reference_code"), "data_files": rec.get("data_files", []),
+                            "answer": rec.get("answer"), "rendered": rec.get("rendered"),
+                            "answer_sha256": rec.get("answer_sha256"), "truth_check": rec["verdict"]})
+            elif meta.get("answer"):
+                row["ground_truth_method"] = "manual"
+            if slot.get("template"):                  # div8 fixed-step templates (hand-off section 5)
+                try:
+                    start = json.loads((b / "task_instruction.json").read_text(encoding="utf-8")).get("start_path")
+                except (OSError, ValueError):
+                    start = None
+                if slot.get("source_task"):          # div9 siblings
+                    row.update({"source_task_id": slot["source_task"], "source_origin": slot.get("source_origin"),
+                                "source_eval": slot.get("source_eval"),
+                                "sibling_kind": (slot.get("sibling_kinds") or {}).get(str(meta.get("rung") or slot.get("rung")))})
+                row.update({"shortest_ui_actions": replay_ui_actions(cfg.run_dir(tid)),
+                            "shortest_ui_actions_author": meta.get("shortest_ui_actions")})
+                row.update({"template": slot["template"], "family": slot["template"], "start_path": start,
+                            "fixed_steps": meta.get("fixed_steps") or slot.get("fixed_steps"),
+                            "wrong_move": meta.get("wrong_move") or slot.get("wrong_move"),
+                            "near_misses": meta.get("near_misses") or row.get("near_misses"),
+                            "needs_long_steps": bool(meta.get("needs_long_steps"))})
+                if meta.get("wrong_move_answers"):
+                    row.update({"wrong_move_answers": meta["wrong_move_answers"],
+                                "wrong_move_scores": rec.get("wrong_move_scores")})
+            if d10 := slot.get("div10"):                  # div10 hand-off section 7
+                c = replay_methods(cfg.run_dir(tid)) or {}
+                row.update({"source_task_ids": meta.get("source_task_ids") or [x["id"] for x in d10["sources"]],
+                            "source_tier": d10.get("tier"), "skill": d10["skill"],
+                            "trouble_class": meta.get("trouble_class"), "trouble": meta.get("trouble"),
+                            "habit_move": meta.get("habit_move"), "trap_spec": meta.get("trap_spec"),
+                            "discoverable_route": meta.get("discoverable_route"),
+                            "efficient_route": meta.get("efficient_route"),
+                            "signal_distance": meta.get("signal_distance"),
+                            "contrast_pair_id": meta.get("contrast_pair_id"),
+                            "start_state_noise": meta.get("start_state_noise"),
+                            "mock_parity_check": meta.get("mock_parity_check"),
+                            "diversity_axes": meta.get("diversity_axes"),
+                            "replay_page_loads": c.get("goto"), "replay_tabs": c.get("newPage"),
+                            "wa_template_ids": meta.get("wa_template_ids") or d10.get("wa_template_ids"),
+                            "split": meta.get("split") or d10.get("split"),
+                            "relation": meta.get("relation") or d10.get("relation"),
+                            "page_path": meta.get("page_path"),
+                            "same_page_path_as_source": meta.get("same_page_path_as_source"),
+                            "anti_copy": {"do_not_copy": [v for x in d10["sources"] for v in x.get("do_not_copy") or []],
+                                          "source_references": [v for x in d10["sources"] for v in x.get("reference") or []],
+                                          "ngram": slot.get("contamination_ngram")}})
+            fh.write(json.dumps(row, default=str) + "\n")
+    return side
 
 
 def stage_plan(cfg: Cfg, stats: Stats) -> bool:
@@ -1474,7 +1989,7 @@ def stage_plan(cfg: Cfg, stats: Stats) -> bool:
         print(f"plan: {rel(cfg.plan_path)} already exists; --force re-plans (bound slots keep their numbers)")
         return False
     bases = cfg.endpoint_bases()
-    missing = [s for s in cfg.spec["plan"]["sites"] if s not in bases]
+    missing = [s for s in div.plan_sites(cfg.spec["plan"]) if s not in bases]
     if missing:
         sys.exit(f"plan: no endpoint for {missing} (CUA_GYM_WEBARENA_*_URL in .env)")
     corpus = div.Corpus(REPO, exclude_batch_dirs=[cfg.tasks_dir])
@@ -1486,7 +2001,11 @@ def stage_plan(cfg: Cfg, stats: Stats) -> bool:
     for s in slots:
         what = {"official_seed": lambda: f"seed {s['seed_id']}: {s['seed_intent'][:70]}",
                 "field": lambda: f"field {s['target_key']}: {', '.join(s['target_fields'][:3])}",
-                "open": lambda: f"open pair {'+'.join(s['pair'])}"}[s["kind"]]()
+                "open": lambda: f"open pair {'+'.join(s['pair'])}",
+                "family": lambda: f"{s['div4_family']}{' UNACHIEVABLE' if s.get('unachievable') else ''}: "
+                                  f"{s.get('example', '')[:60]}",
+                "assignment": lambda: f"{s['variant_type']:<11} of {s['parent_task_id']} (pass "
+                                      f"{s.get('parent_pass_rate')}): {(s.get('failure_summary') or '')[:50]}"}[s["kind"]]()
         print(f"  {s['slot']:>3} {s['site']:<14} {s['style']:<8} {'short' if s.get('short') else '     '} {what}")
     return True
 
@@ -1515,13 +2034,19 @@ def gateway_probe(prof: dict[str, Any]) -> tuple[bool, str]:
                          "messages": [{"role": "user", "content": "ping"}]}).encode(),
         headers={"Authorization": f"Bearer {token}", "content-type": "application/json",
                  "anthropic-version": "2023-06-01"})
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return resp.status == 200, f"HTTP {resp.status}"
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001
-        return False, repr(exc)[:120]
+    detail = ""
+    for attempt in range(4):      # the gateway answers 503 intermittently (2026-10-10); sessions retry, so may we
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                return resp.status == 200, f"HTTP {resp.status}" + (f" after {attempt} retries" if attempt else "")
+        except urllib.error.HTTPError as exc:
+            detail = f"HTTP {exc.code}"
+            if exc.code < 500 and exc.code != 429:
+                return False, detail
+        except Exception as exc:  # noqa: BLE001
+            detail = repr(exc)[:120]
+        time.sleep(15 * (attempt + 1))
+    return False, detail + " (4 attempts)"
 
 
 def print_status(cfg: Cfg, state: State) -> None:
@@ -1685,7 +2210,7 @@ def build_cfg(args: argparse.Namespace) -> Cfg:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["ping", "preflight", "plan", "author", "gate", "repair", "verify", "post",
-                                       "fix", "export", "diversity", "status", "all"])
+                                       "fix", "export", "diversity", "truth", "status", "all"])
     p.add_argument("--role", default="default", choices=["default", "author", "verify"],
                    help="ping: which session profile to test (author = the spec's authoring model)")
     p.add_argument("--default-profile-only", action="store_true",
@@ -1762,6 +2287,8 @@ def main() -> int:
                 print_status(cfg, state)
             elif args.command == "export":
                 stage_export(cfg, state, stats)
+            elif args.command == "truth":             # div5 hand-off 3C: code-computed truth retrofit + report
+                asyncio.run(stage_truth(cfg, state, stats))
             elif args.command == "all":
                 return asyncio.run(cmd_all(cfg, state, stats, args.skip_preflight))
             return 0
